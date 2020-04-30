@@ -4,6 +4,8 @@ const Joi = require('@hapi/joi')
 const chai = require('chai')
 const { expect } = chai
 const sinon = require('sinon')
+const prometheus = require('prom-client')
+const PrometheusMetrics = require('../server/prometheus-metrics')
 const trace = require('./trace')
 const {
   NotFound,
@@ -13,7 +15,7 @@ const {
   Deprecated,
 } = require('./errors')
 const BaseService = require('./base')
-
+const { MetricHelper, MetricNames } = require('./metric-helper')
 require('../register-chai-plugins.spec')
 chai.use(require('chai-as-promised'))
 
@@ -65,8 +67,20 @@ class DummyService extends BaseService {
   }
 }
 
+class DummyServiceWithServiceResponseSizeMetricEnabled extends DummyService {
+  static get enabledMetrics() {
+    return [MetricNames.SERVICE_RESPONSE_SIZE]
+  }
+}
+
 describe('BaseService', function() {
-  const defaultConfig = { handleInternalErrors: false, private: {} }
+  const defaultConfig = {
+    public: {
+      handleInternalErrors: false,
+      services: {},
+    },
+    private: {},
+  }
 
   it('Invokes the handler as expected', async function() {
     expect(
@@ -378,7 +392,7 @@ describe('BaseService', function() {
       expect(mockSendBadge).to.have.been.calledWith(expectedFormat, {
         text: ['cat', 'Hello namedParamA: bar with queryParamA: ?'],
         color: 'lightgrey',
-        template: undefined,
+        template: 'flat',
         namedLogo: undefined,
         logo: undefined,
         logoWidth: undefined,
@@ -498,18 +512,72 @@ describe('BaseService', function() {
     })
   })
 
+  describe('Metrics', function() {
+    let register
+    beforeEach(function() {
+      register = new prometheus.Registry()
+    })
+    const url = 'some-url'
+
+    it('service response size metric is optional', async function() {
+      const metricHelper = MetricHelper.create({
+        metricInstance: new PrometheusMetrics({ register }),
+        ServiceClass: DummyServiceWithServiceResponseSizeMetricEnabled,
+      })
+      const sendAndCacheRequest = async () => ({
+        buffer: 'x'.repeat(65536 + 1),
+        res: { statusCode: 200 },
+      })
+      const serviceInstance = new DummyServiceWithServiceResponseSizeMetricEnabled(
+        { sendAndCacheRequest, metricHelper },
+        defaultConfig
+      )
+
+      await serviceInstance._request({ url })
+
+      expect(register.getSingleMetricAsString('service_response_bytes'))
+        .to.contain(
+          'service_response_bytes_bucket{le="65536",category="other",family="undefined",service="dummy_service_with_service_response_size_metric_enabled"} 0\n'
+        )
+        .and.to.contain(
+          'service_response_bytes_bucket{le="131072",category="other",family="undefined",service="dummy_service_with_service_response_size_metric_enabled"} 1\n'
+        )
+    })
+
+    it('service response size metric is disabled by default', async function() {
+      const metricHelper = MetricHelper.create({
+        metricInstance: new PrometheusMetrics({ register }),
+        ServiceClass: DummyService,
+      })
+      const sendAndCacheRequest = async () => ({
+        buffer: 'x',
+        res: { statusCode: 200 },
+      })
+      const serviceInstance = new DummyService(
+        { sendAndCacheRequest, metricHelper },
+        defaultConfig
+      )
+
+      await serviceInstance._request({ url })
+
+      expect(
+        register.getSingleMetricAsString('service_response_bytes')
+      ).to.not.contain('service_response_bytes_bucket')
+    })
+  })
   describe('auth', function() {
     class AuthService extends DummyService {
       static get auth() {
         return {
           passKey: 'myci_pass',
+          serviceKey: 'myci',
           isRequired: true,
         }
       }
 
       async handle() {
         return {
-          message: `The CI password is ${this.authHelper.pass}`,
+          message: `The CI password is ${this.authHelper._pass}`,
         }
       }
     }
@@ -518,7 +586,13 @@ describe('BaseService', function() {
       expect(
         await AuthService.invoke(
           {},
-          { defaultConfig, private: { myci_pass: 'abc123' } },
+          {
+            public: {
+              ...defaultConfig.public,
+              services: { myci: { authorizedOrigins: ['https://myci.test'] } },
+            },
+            private: { myci_pass: 'abc123' },
+          },
           { namedParamA: 'bar.bar.bar' }
         )
       ).to.deep.equal({ message: 'The CI password is abc123' })
@@ -526,9 +600,19 @@ describe('BaseService', function() {
 
     it('when auth is not configured properly, invoke() returns inacessible', async function() {
       expect(
-        await AuthService.invoke({}, defaultConfig, {
-          namedParamA: 'bar.bar.bar',
-        })
+        await AuthService.invoke(
+          {},
+          {
+            public: {
+              ...defaultConfig.public,
+              services: { myci: { authorizedOrigins: ['https://myci.test'] } },
+            },
+            private: {},
+          },
+          {
+            namedParamA: 'bar.bar.bar',
+          }
+        )
       ).to.deep.equal({
         color: 'lightgray',
         isError: true,
